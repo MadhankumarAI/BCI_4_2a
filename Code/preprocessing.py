@@ -23,16 +23,11 @@ def bandpass_filter(data, lowcut, highcut, fs, order=4):
     
     # Check data shape
     if data.ndim == 3:
-        # (trials, samples, channels)
-        filtered_data = np.zeros_like(data)
-        for i in range(data.shape[0]):
-            for j in range(data.shape[2]):
-                filtered_data[i, :, j] = filtfilt(b, a, data[i, :, j])
+        # Filter along axis 1 (samples)
+        return filtfilt(b, a, data, axis=1)
     elif data.ndim == 2:
-        # (samples, channels)
-        filtered_data = np.zeros_like(data)
-        for j in range(data.shape[1]):
-            filtered_data[:, j] = filtfilt(b, a, data[:, j])
+        # Filter along axis 0 (samples)
+        return filtfilt(b, a, data, axis=0)
     else:
         raise ValueError("Data must be 2D or 3D")
         

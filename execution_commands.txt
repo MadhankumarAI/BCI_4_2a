@@ -1,0 +1,43 @@
+Brain-Computer Interface (BCI) Motor Imagery Classification Pipelines
+=====================================================================
+The models are structured into three progressively advanced pipelines.
+Each script automatically loads the data, trains the models, performs 
+cross-validation, and outputs the Accuracy and Cohen's Kappa scores.
+
+Before running any of the scripts, make sure your virtual environment 
+is activated:
+  .\venv\Scripts\activate
+
+
+1. FBCSP (Filter Bank Common Spatial Pattern)
+---------------------------------------------
+Our baseline model that optimizes spatial filters across multiple frequency bands.
+Execution command:
+  python Code/main.py
+
+
+2. Riemannian Tangent Space Mapping (TSM)
+-----------------------------------------
+State-of-the-art Riemannian geometry model. Computes covariance matrices, 
+finds their Log-Euclidean geometric mean, and projects them into a tangent 
+space to achieve high noise resilience.
+Execution command:
+  python Code/Riemannian/main.py
+
+
+3. 4-Model Soft-Voting Ensemble
+-------------------------------
+Combines 4 complementary classifiers (FBCSP, Riemannian TSM, MDM, and 
+Augmented Covariance) via soft-voting probability averaging. Achieved our 
+highest validated score (0.7146 Mean Kappa).
+Execution command:
+  python Code/Ensemble/main.py
+
+
+4. Stacked Ensemble with Meta-Learner (Advanced)
+------------------------------------------------
+Trains 15 base classifiers (5 models across 3 time windows) and uses a 
+Logistic Regression meta-learner on out-of-fold predictions. This is the 
+most computationally heavy pipeline.
+Execution command:
+  python Code/StackedEnsemble/main.py

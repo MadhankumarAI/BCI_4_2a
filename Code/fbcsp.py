@@ -1,11 +1,12 @@
 import numpy as np
 import scipy.linalg as la
 from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.feature_selection import SelectKBest, mutual_info_classif
+from sklearn.feature_selection import SelectKBest, f_classif
 
 class CSP(BaseEstimator, TransformerMixin):
     """
     Common Spatial Pattern (CSP) feature extraction.
+    Vectorized and optimized for high-performance execution.
     """
     def __init__(self, m_components=4):
         self.m_components = m_components
@@ -16,7 +17,6 @@ class CSP(BaseEstimator, TransformerMixin):
         X: array of shape (trials, samples, channels)
         y: array of shape (trials,) containing class labels (1 and 2)
         """
-        # Ensure labels are 1 and 2 for our specific task
         classes = np.unique(y)
         if len(classes) != 2:
             raise ValueError("CSP requires exactly two classes.")
@@ -30,21 +30,18 @@ class CSP(BaseEstimator, TransformerMixin):
         cov1 = self._compute_covariance(X1)
         cov2 = self._compute_covariance(X2)
         
-        # Solve generalized eigenvalue problem
-        # cov1 * W = lambda * (cov1 + cov2) * W
-        # Using eigh since covariance matrices are symmetric positive semi-definite
+        # Solve generalized eigenvalue problem: cov1 * W = lambda * (cov1 + cov2) * W
         eigen_values, eigen_vectors = la.eigh(cov1, cov1 + cov2)
         
         # Sort eigenvectors by eigenvalues in descending order
         idx = np.argsort(eigen_values)[::-1]
-        eigen_vectors = eigen_vectors[:, idx]
-        
-        self.filters_ = eigen_vectors
+        self.filters_ = eigen_vectors[:, idx]
         return self
         
     def transform(self, X):
         """
-        Extract log-variance features.
+        Extract log-variance features. Vectorized across all trials.
+        X: (trials, samples, channels)
         """
         if self.filters_ is None:
             raise RuntimeError("CSP not fitted.")
@@ -53,35 +50,27 @@ class CSP(BaseEstimator, TransformerMixin):
         m_half = self.m_components // 2
         W = np.concatenate([self.filters_[:, :m_half], self.filters_[:, -m_half:]], axis=1)
         
-        features = []
-        for i in range(X.shape[0]):
-            trial = X[i]
-            # Project data: (samples, channels) @ (channels, m_components)
-            projected = np.dot(trial, W)
-            # Calculate variance along time axis
-            var = np.var(projected, axis=0)
-            # Log-variance
-            log_var = np.log(var / np.sum(var))
-            features.append(log_var)
-            
-        return np.array(features)
+        # Vectorized projection: (trials, samples, channels) @ (channels, m) -> (trials, samples, m)
+        projected = np.matmul(X, W)
+        
+        # Calculate variance along the time axis (samples, axis=1)
+        var = np.var(projected, axis=1)
+        
+        # Calculate log-variance features normalized by sum of variances
+        log_var = np.log(var / np.sum(var, axis=1, keepdims=True))
+        return log_var
         
     def _compute_covariance(self, X_class):
         """
-        Compute average covariance matrix across trials.
+        Compute average covariance matrix across trials using vectorized np.einsum.
         X_class: (trials, samples, channels)
         """
-        from sklearn.covariance import LedoitWolf
-        lw = LedoitWolf()
-        covs = []
-        for i in range(X_class.shape[0]):
-            trial = X_class[i]
-            # Center the data
-            trial_centered = trial - np.mean(trial, axis=0)
-            # Fit LedoitWolf on (samples, channels)
-            lw.fit(trial_centered)
-            covs.append(lw.covariance_)
-            
+        n_samples = X_class.shape[1]
+        X_centered = X_class - np.mean(X_class, axis=1, keepdims=True)
+        
+        # Covariance: (1/(samples-1)) * (X_centered.T @ X_centered) for each trial
+        covs = np.einsum('tsf,tsc->tfc', X_centered, X_centered) / (n_samples - 1)
+        
         # Mean across trials
         cov_mean = np.mean(covs, axis=0)
         
@@ -97,7 +86,12 @@ class FBCSP(BaseEstimator, TransformerMixin):
         self.m_components = m_components
         self.k_features = k_features
         self.csps = []
-        self.feature_selector = SelectKBest(mutual_info_classif, k=self.k_features)
+        self.feature_selector = SelectKBest(f_classif, k=self.k_features)
+        
+    def set_params(self, **params):
+        super().set_params(**params)
+        self.feature_selector = SelectKBest(f_classif, k=self.k_features)
+        return self
         
     def fit(self, X, y):
         """
@@ -109,7 +103,6 @@ class FBCSP(BaseEstimator, TransformerMixin):
         all_features = []
         for b in range(n_bands):
             csp = CSP(m_components=self.m_components)
-            # X[:, b] gets shape (trials, samples, channels)
             csp.fit(X[:, b], y)
             self.csps.append(csp)
             

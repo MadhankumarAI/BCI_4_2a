@@ -1,32 +1,38 @@
 import numpy as np
+import sys
 from pathlib import Path
-from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as LDA
+from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
+from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import GridSearchCV, StratifiedKFold
 from sklearn.metrics import accuracy_score, cohen_kappa_score
 import warnings
 
+# Add parent directory to path to import data_loader and preprocessing
+sys.path.append(str(Path(__file__).parent.parent))
+
 from data_loader import load_and_epoch_data, load_true_labels
 from preprocessing import apply_filter_bank, common_average_reference
-from fbcsp import FBCSP
+from riemann import FilterBankTangentSpace, precompute_covariances
 
-# Suppress some potential sklearn warnings about rank-deficient covariance matrices during CV
 warnings.filterwarnings("ignore")
 
 def main():
-    data_dir = Path(r"c:\Users\jaip7\Downloads\madhan\BCI\BCICIV-2a-mat")
-    labels_dir = Path(r"c:\Users\jaip7\Downloads\madhan\BCI\true_labels")
+    current_dir = Path(__file__).parent
+    data_dir = current_dir.parent.parent / "BCICIV-2a-mat"
+    labels_dir = current_dir.parent.parent / "true_labels"
     
     subjects = [f"A0{i}" for i in range(1, 10)]
     accuracies = []
     kappas = []
     
-    # 0.5s to 4.0s after cue (which is 2.5s to 6.0s relative to trial start)
+    # 0.5s to 4.0s post-cue (optimal time window)
     start_sec = 2.5
     end_sec = 6.0
     
-    print(f"Running FBCSP Pipeline with Optimal Window: {start_sec-2.0}s to {end_sec-2.0}s post-cue")
+    print(f"Running Riemannian Tangent Space Pipeline...")
+    print(f"Time Window: {start_sec-2.0}s to {end_sec-2.0}s post-cue")
     print("-" * 50)
     
     for subject in subjects:
@@ -39,41 +45,41 @@ def main():
         # --- Training ---
         X_train_raw, y_train, _ = load_and_epoch_data(train_file, start_sec=start_sec, end_sec=end_sec)
         
-        # Apply Common Average Reference (CAR)
+        # Apply CAR and Filter Bank
         X_train_car = common_average_reference(X_train_raw)
-        
-        # Apply Filter Bank
         X_train_fb = apply_filter_bank(X_train_car)
         
-        # Setup Pipeline with FBCSP and Shrinkage LDA
+        # Precompute covariances
+        covs_train = precompute_covariances(X_train_fb)
+        
+        # Setup Pipeline with Filter Bank Tangent Space + regularized Logistic Regression
         pipeline = Pipeline([
-            ('fbcsp', FBCSP()),
+            ('fbts', FilterBankTangentSpace()),
+            ('select', SelectKBest(f_classif)),
             ('scaler', StandardScaler()),
-            ('lda', LDA(solver='lsqr', shrinkage='auto'))
+            ('clf', LogisticRegression(solver='liblinear', penalty='l2', random_state=42))
         ])
         
-        # Grid Search for best k_features and m_components using inner Cross-Validation
+        # Grid Search over feature selection k and classifier C
         param_grid = {
-            'fbcsp__k_features': [4, 6, 8, 10, 12, 16],
-            'fbcsp__m_components': [2, 4, 6]
+            'select__k': [50, 100, 150, 200, 'all'],
+            'clf__C': [0.01, 0.1, 1.0, 10.0]
         }
         
         cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
         grid_search = GridSearchCV(pipeline, param_grid, cv=cv, scoring='accuracy', n_jobs=1)
         
-        # Fit Grid Search
-        grid_search.fit(X_train_fb, y_train)
+        # Fit Grid Search using precomputed covariances
+        grid_search.fit(covs_train, y_train)
         best_model = grid_search.best_estimator_
         
         print(f"  Best params: {grid_search.best_params_}")
         
         # --- Evaluation ---
         X_test_raw, _, test_indices = load_and_epoch_data(test_file, start_sec=start_sec, end_sec=end_sec)
-        
-        # Load true labels for evaluation
         y_test_all = load_true_labels(true_labels_file)
         
-        # Align evaluation labels with the kept trials (non-artifacts)
+        # Align evaluation labels with clean trials
         y_test_all = y_test_all[test_indices]
         
         # Filter evaluation trials to only Class 1 (Left) and Class 2 (Right)
@@ -85,8 +91,11 @@ def main():
         X_test_car = common_average_reference(X_test_raw_filtered)
         X_test_fb = apply_filter_bank(X_test_car)
         
+        # Precompute test covariances
+        covs_test = precompute_covariances(X_test_fb)
+        
         # Predict and evaluate
-        y_pred = best_model.predict(X_test_fb)
+        y_pred = best_model.predict(covs_test)
         acc = accuracy_score(y_test, y_pred)
         kappa = cohen_kappa_score(y_test, y_pred)
         
