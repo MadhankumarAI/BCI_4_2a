@@ -1,0 +1,266 @@
+GAN-Augmented BCI Motor Imagery Pipeline - How To Run
+=====================================================
+Task: Left vs Right motor imagery, BCI Competition IV Dataset 2a.
+Baseline to beat: Code/StackedEnsemble/main.py, 0.72 mean kappa.
+
+Everything new lives in Code/GAN/. Nothing in Code/ was modified, so the
+original four pipelines still run exactly as before.
+
+
+-------------------------------------------------------------------------
+0. ONE-TIME SETUP
+-------------------------------------------------------------------------
+Activate the virtual environment:
+
+    .\venv\Scripts\activate
+
+PyTorch is a new dependency (the previous pipelines were numpy/sklearn only).
+It is already installed in this venv. If you rebuild the venv:
+
+    pip install -r requirements.txt
+
+Verify:
+
+    python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+
+If that prints False you are on CPU. Everything still works, it is just
+slower - see the timing table in step 1.
+
+
+-------------------------------------------------------------------------
+1. TRAIN THE GENERATORS  (the long step)
+-------------------------------------------------------------------------
+    python Code/GAN/train_gan.py
+
+What it does, for each of the 9 subjects:
+  - loads only the T (training) session, Left/Right, artefact-free
+  - trains 1 "full" generator on all of that subject's training trials
+  - trains 3 more generators, one per gate fold, each blind to its own fold
+  - samples a pool of synthetic trials from each and caches them
+
+Output goes to Code/GAN/checkpoints/ :
+    A0x_synth.npz    synthetic trials + the fold assignment main.py reuses
+    A0x_gan.pt       generator weights + training history
+
+Why 4 generators per subject and not 1: step 3 decides how much synthetic
+data to use by cross-validating on the training session. If a single
+generator trained on all of it produced the synthetic data for every fold,
+each fold's "held-out" trials would already be baked into the fakes added to
+its training set. The gate would then always vote for more synthetic data.
+The per-fold generators are the only thing making that decision honest.
+
+TIMING - read this before you start it.
+    Roughly 36 generator trainings (9 subjects x 4). On CPU budget several
+    hours; start it and leave it. Options to cut it down:
+
+    Smoke test first (60 steps/stage - the samples ARE noise, this only
+    proves the plumbing works end to end):
+        python Code/GAN/train_gan.py --quick --subjects A01
+
+    One subject at a time, so you can check progress:
+        python Code/GAN/train_gan.py --subjects A01
+        python Code/GAN/train_gan.py --subjects A02
+        ...
+
+    Shorter training (lower quality, faster):
+        python Code/GAN/train_gan.py --steps 600
+
+    On a GPU machine it picks CUDA up automatically; force it with
+        python Code/GAN/train_gan.py --device cuda
+
+Useful flags:
+    --steps N           generator steps per resolution stage, 6 stages
+                        (default 1200)
+    --gate-folds N      folds for the selection gate (default 3)
+    --no-gate-folds     train only the full generator - faster, but main.py
+                        then has no leak-free gate. Do not use for results
+                        you intend to report.
+    --up-mode nearest   reproduces Hartmann's aliasing comparison. This is an
+                        ablation only; it injects high-frequency artefacts
+                        straight into the 4-40 Hz band the classifiers read.
+    --no-diffaug        turns off the adaptive augmentation. Also an ablation;
+                        expect the memorisation check in step 2 to fail.
+
+
+-------------------------------------------------------------------------
+2. AUDIT THE GENERATORS  (fast - do not skip this)
+-------------------------------------------------------------------------
+    python Code/GAN/evaluate_gan.py
+
+Prints one row per subject. Nothing here feeds into the final model; this is
+the evidence that the synthetic data is real EEG and is genuinely new.
+
+    PSD        mean |log10| difference of the power spectra, 1-45 Hz.
+               Small is good. A large value driven by excess high-frequency
+               power means upsampling aliasing - re-run with --up-mode cubic.
+
+    mu err     relative band-power error, 8-13 Hz
+    beta err   relative band-power error, 13-30 Hz
+               These two bands are where motor imagery actually lives, so
+               these matter more than the overall PSD number.
+
+    FTD        Frechet distance in Riemannian tangent space. Our EEG version
+               of FID - tangent space instead of Inception features, because
+               tangent space is literally what 3 of the 5 base models eat.
+               Lower is better, but see the warning below.
+
+    SWD        sliced Wasserstein distance. Lower is better. Hartmann et al.
+               found this tracked realism better than FID did.
+
+    nn         *** THE IMPORTANT ONE ***
+               Distance from a fake trial to its nearest real trial, divided
+               by the typical distance between two real trials.
+                   ~1.0  fakes sit at the same spacing as reals. Target.
+                   <0.7  the generator is re-emitting training trials.
+                         The run has failed. Do not use that subject's data.
+                         This is both a useless-augmentation problem and,
+                         clinically, a re-identification hazard.
+                   >>1   fakes are off-manifold; undertrained.
+
+    TSTR       train on synthetic, test on real held-out trials
+    base       train on real, test on the same real held-out trials
+               Want TSTR within a few points of base.
+
+    TRTS       train on real, test on synthetic. Want it near TSTR. Much
+               higher means the generator is producing exaggerated, too-easily
+               separable class prototypes.
+
+The script prints an explicit WARNING listing any subject whose nn ratio is
+below 0.7.
+
+Do NOT pick a generator by best FID/FTD. Hartmann et al. section 5 report
+that their best-FID model produced the least realistic spectra, and that the
+Inception Score gave no signal at all about a collapsed model. Read the panel
+as a panel.
+
+Save it for the record:
+    python Code/GAN/evaluate_gan.py --json gan_audit.json
+
+
+-------------------------------------------------------------------------
+3. RUN THE AUGMENTED ENSEMBLE  (the result)
+-------------------------------------------------------------------------
+    python Code/GAN/main.py
+
+Same 15 base learners as Code/StackedEnsemble/main.py (5 models x 3 time
+windows) and the same logistic-regression meta-learner on out-of-fold
+predictions. The one change: the base learners may also be trained on
+synthetic trials, and whether they are is decided per subject.
+
+Per subject it prints the gate table, e.g.
+
+    gate (3-fold, leak-free):
+      gan@1.0          kappa  0.781 +/- 0.031  <- selected
+      segrec@1.0       kappa  0.766 +/- 0.028
+      none             kappa  0.742 +/- 0.026
+      ...
+    final base fit: 138 real + 138 synthetic
+    >>> gan@1.0          accuracy 88.65%  kappa 0.7730
+
+then the per-subject table and the mean.
+
+The four safeguards, since this is a medical pipeline:
+
+  1. The E (evaluation) session is never used for any decision. The GAN, the
+     normalisation statistics, and the augmentation choice all come from the
+     T session. E is read once, at the end, for the reported number.
+
+  2. The gate is leak-free - fold k is scored with a generator that never saw
+     fold k. Same folds are reused for the meta-learner's out-of-fold stage.
+
+  3. "none" is the default and wins ties. The winner is chosen by the
+     one-standard-error rule: a candidate must beat the un-augmented baseline
+     by more than one standard error of the fold scores. Taking the plain
+     argmax over 6 candidates on ~45 validation trials would itself be
+     overfitting. Expect several subjects to come out as "none" - that is the
+     safeguard working, not a bug.
+
+  4. The GAN competes against free alternatives in the same pool:
+     segment-recombination and Riemannian geodesic re-colouring. If it cannot
+     beat methods that cost milliseconds and cannot memorise anything, it is
+     not used.
+
+Synthetic trials only ever enter BASE-LEARNER training sets. The meta-learner
+is always fitted on out-of-fold predictions for real trials.
+
+Useful flags:
+    --subjects A01 A02   run a subset
+    --all-candidates     adds the noise/shift controls and a GAN+segrec
+                         mixture to the gate. Use for the ablation table.
+    --no-gan             ignore the cached generators entirely and let only
+                         the classical methods compete. THIS IS THE ABLATION
+                         THE GAN HAS TO BEAT - run it and compare.
+    --json results.json  save everything, including the gate tables
+
+
+-------------------------------------------------------------------------
+4. RECOMMENDED SEQUENCE FOR A REPORTABLE RESULT
+-------------------------------------------------------------------------
+    .\venv\Scripts\activate
+
+    python Code/GAN/train_gan.py --quick --subjects A01     # 2 min, plumbing
+    python Code/GAN/train_gan.py                            # hours
+    python Code/GAN/evaluate_gan.py --json gan_audit.json   # read the nn col
+
+    python Code/StackedEnsemble/main.py                     # 0.72 reference
+    python Code/GAN/main.py --no-gan --json res_classical.json
+    python Code/GAN/main.py --all-candidates --json res_gan.json
+
+Three numbers to compare:
+    StackedEnsemble          the published 0.72 baseline
+    --no-gan                 classical augmentation only
+    --all-candidates         GAN in the pool
+
+If the third is not meaningfully above the second, the honest conclusion is
+that the GAN did not help on this dataset - which is a legitimate finding at
+110 training trials per subject, and is what the gate is designed to detect
+rather than paper over.
+
+
+-------------------------------------------------------------------------
+5. FILE MAP
+-------------------------------------------------------------------------
+Code/GAN/data.py          canonical 875-sample window, the three ensemble
+                          windows as exact crops of it, CAR + 4-40 Hz +
+                          z-score, and the shared fold split that train_gan.py
+                          and main.py must agree on
+Code/GAN/diffaug.py       differentiable augmentation applied to real and fake
+                          batches before the critic - the thing that stops
+                          memorisation at this sample size
+Code/GAN/eeg_wgan.py      conditional progressive WGAN-GP. Hartmann et al.
+                          2018 architecture: 6 resolution stages 28->896,
+                          interpolation upsampling (never transposed conv),
+                          equalised LR, pixel norm, minibatch stddev,
+                          one-sided distance-relaxed gradient penalty,
+                          n_critic=5, plus class projection and EMA
+Code/GAN/augment.py       classical baselines: segment-recombination,
+                          Riemannian geodesic re-colouring, noise, time-shift
+Code/GAN/gan_metrics.py   the audit panel: PSD, band power, tangent-space
+                          Frechet, sliced Wasserstein, nearest-neighbour
+                          memorisation ratio, TSTR/TRTS
+Code/GAN/train_gan.py     step 1
+Code/GAN/evaluate_gan.py  step 2
+Code/GAN/main.py          step 3
+Code/GAN/README.md        the design rationale and the paper citations
+
+
+-------------------------------------------------------------------------
+6. TROUBLESHOOTING
+-------------------------------------------------------------------------
+"cache holds N training trials but the loader produced M"
+    A0x_synth.npz was built against different data or a different window.
+    Re-run train_gan.py for that subject.
+
+"A0x_synth.npz missing - run train_gan.py first"
+    evaluate_gan.py and main.py both need step 1 to have completed for the
+    subjects you are asking for.
+
+main.py prints "none" for every subject
+    Working as designed if the GAN is weak. Check step 2's nn column first:
+    if it is below 0.7 the generators memorised and need retraining
+    (more steps, or leave --no-diffaug off). If nn is healthy and the gate
+    still says none, the GAN genuinely is not adding information.
+
+Out of memory / too slow
+    Lower --batch-size (default 32) or --steps. The model is ~1.4M parameters
+    per network, so memory is rarely the constraint; time is.
