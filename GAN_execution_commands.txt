@@ -10,6 +10,33 @@ original four pipelines still run exactly as before.
 -------------------------------------------------------------------------
 0. ONE-TIME SETUP
 -------------------------------------------------------------------------
+DATASET PATHS. All filesystem locations live in ONE file:
+
+    Code/GAN/paths.py
+
+They are absolute pathlib.Path objects. Currently:
+
+    PROJECT_ROOT   C:\Users\jaip7\Downloads\madhan\BCI
+    DATA_DIR       C:\Users\jaip7\Downloads\madhan\BCI\BCICIV-2a-mat
+    LABELS_DIR     C:\Users\jaip7\Downloads\madhan\BCI\true_labels
+    CHECKPOINT_DIR C:\Users\jaip7\Downloads\madhan\BCI\Code\GAN\checkpoints
+
+If the project moves, edit PROJECT_ROOT and nothing else - the rest derive
+from it. Or override without editing, via environment variables:
+
+    set BCI_PROJECT_ROOT=D:\work\BCI
+    set BCI_DATA_DIR=D:\datasets\BCICIV-2a-mat
+    set BCI_LABELS_DIR=D:\datasets\true_labels
+    set BCI_CHECKPOINT_DIR=D:\scratch\gan_ckpt
+
+All three scripts print the paths they resolved and call paths.verify()
+before doing any work, so a wrong path fails in the first second with a list
+of exactly which files are missing - not hours in.
+
+Check them without running anything:
+
+    python Code/GAN/paths.py
+
 Activate the virtual environment:
 
     .\venv\Scripts\activate
@@ -49,29 +76,101 @@ each fold's "held-out" trials would already be baked into the fakes added to
 its training set. The gate would then always vote for more synthetic data.
 The per-fold generators are the only thing making that decision honest.
 
-TIMING - read this before you start it.
-    Roughly 36 generator trainings (9 subjects x 4). On CPU budget several
-    hours; start it and leave it. Options to cut it down:
+TIMING - READ THIS BEFORE YOU START IT.
+    This model is expensive on CPU. Measured on this machine (12 logical
+    cores), at the default batch size of 16:
 
-    Smoke test first (60 steps/stage - the samples ARE noise, this only
-    proves the plumbing works end to end):
-        python Code/GAN/train_gan.py --quick --subjects A01
+        --preset smoke      seconds/generator   OUTPUT IS NOISE, plumbing only
+        --preset fast       ~8 min/generator    27 generators  ~4 hours
+        --preset balanced   ~23 min/generator   36 generators  ~14 hours
+        --preset thorough   ~50 min/generator   36 generators  ~29 hours
 
-    One subject at a time, so you can check progress:
+    `balanced` is the default. Always check the real number for YOUR machine
+    first - the script times a few actual steps at each resolution and
+    extrapolates:
+
+        python Code/GAN/train_gan.py --dry-run
+
+    That prints the per-generator and total estimate and exits without
+    training. It also prints the resolved dataset paths.
+
+    Prove the plumbing works end to end in under a minute (the samples are
+    deliberately noise at this budget - evaluate_gan.py will correctly report
+    them as garbage, and main.py refuses to use a smoke cache at all):
+
+        python Code/GAN/train_gan.py --preset smoke --subjects A01
+
+    Then the real thing. It is resumable per subject, so this is the safe way
+    to run it:
+
+        python Code/GAN/train_gan.py --preset fast
+        python Code/GAN/train_gan.py --skip-existing        # upgrade later
+
+    Or one subject at a time:
         python Code/GAN/train_gan.py --subjects A01
         python Code/GAN/train_gan.py --subjects A02
-        ...
 
-    Shorter training (lower quality, faster):
-        python Code/GAN/train_gan.py --steps 600
-
-    On a GPU machine it picks CUDA up automatically; force it with
+    On a GPU machine CUDA is picked up automatically; force it with
         python Code/GAN/train_gan.py --device cuda
 
+WHAT THE TRAINING LOG TELLS YOU
+    At every resolution stage the trainer prints a line like
+
+      stage 5 done (len  896): amp x0.88 total / x0.82 in-band,
+                               out-of-band 14%, r_v 0.09, aug 0.00
+
+    amp ... in-band   Amplitude of the synthetic relative to real, restricted
+                      to the frequencies where the real data has power.
+                      Sampled from the EMA weights, i.e. the ones that
+                      actually get saved. This should climb towards 1.0 as
+                      the stages progress. If it is still far from 1.0 at
+                      stage 5, the run is under-trained - raise --preset.
+    out-of-band       Share of synthetic power outside the real spectrum's
+                      support. Should fall.
+    r_v               Memorisation pressure: the fraction of the critic's
+                      real-vs-fake score gap that is explained by
+                      train-vs-unseen-real. Near 0 early on is correct.
+    aug               Augmentation strength, raised automatically once r_v
+                      goes above 0.4. Staying at 0.00 early is correct; it
+                      should engage once the critic starts to memorise.
+
+    Then, per generator:
+
+      [full] 138 real -> 414 synthetic in 21.0 min
+             | lost to CAR 0%, to band-pass 31% | amplitude x0.94 of real
+
+    lost to CAR       Should be ~0%. The generator projects the common mode
+                      out by construction; anything else means that
+                      projection is not being applied.
+    lost to band-pass Share of the raw output the 4-40 Hz filter removes.
+                      Falls as training progresses.
+    amplitude         *** THE ONE TO WATCH ***  Post-filter amplitude versus
+                      real. This is the authoritative figure and the same
+                      number evaluate_gan.py reports in its `amp` column.
+                      Want ~1.0; outside [0.5, 2.0] you get a warning and the
+                      generator is not ready to use.
+
+    Note the in-log "out-of-band" and the "lost to band-pass" figures are not
+    directly comparable: the log defines the band as the real spectrum's
+    99%-energy support, which includes low-frequency bins that the actual
+    Butterworth filter attenuates. The log line is for spotting a TREND; the
+    per-generator "amplitude x..." line is the number to judge by.
+
 Useful flags:
-    --steps N           generator steps per resolution stage, 6 stages
-                        (default 1200)
-    --gate-folds N      folds for the selection gate (default 3)
+    --preset NAME       smoke | fast | balanced | thorough (see above)
+    --dry-run           print the time estimate and exit
+    --skip-existing     leave subjects that already have a cache alone
+    --steps N           generator steps at the BASE resolution. Later stages
+                        get proportionally fewer (STAGE_STEP_SCALE in
+                        eeg_wgan.py), because at 896 samples one stage costs
+                        more than the first three combined.
+    --batch-size N      default 16. On CPU cost is near-linear in this.
+    --gp-every N        lazy gradient penalty interval (default 4, 1 =
+                        textbook WGAN-GP). The penalty needs a double backward
+                        and costs about as much as the rest of the critic
+                        step; evaluating it a quarter as often at 4x the
+                        weight is roughly a 2x speedup.
+    --gate-folds N      folds for the selection gate (default 3, minimum 2)
     --no-gate-folds     train only the full generator - faster, but main.py
                         then has no leak-free gate. Do not use for results
                         you intend to report.
@@ -89,6 +188,15 @@ Useful flags:
 
 Prints one row per subject. Nothing here feeds into the final model; this is
 the evidence that the synthetic data is real EEG and is genuinely new.
+
+    amp        *** CHECK THIS FIRST ***  Per-channel standard deviation of
+               synthetic over real, after the same CAR and band-pass the real
+               trials get. Want ~1.0. Outside [0.5, 2.0] the script prints a
+               warning and you should stop reading the rest of the row - an
+               under-trained generator gets the spectral SHAPE roughly right
+               long before it gets the SCALE right, and the covariance-based
+               models that make up most of this ensemble see the SQUARE of any
+               scale error.
 
     PSD        mean |log10| difference of the power spectra, 1-45 Hz.
                Small is good. A large value driven by excess high-frequency
@@ -198,8 +306,9 @@ Useful flags:
 -------------------------------------------------------------------------
     .\venv\Scripts\activate
 
-    python Code/GAN/train_gan.py --quick --subjects A01     # 2 min, plumbing
-    python Code/GAN/train_gan.py                            # hours
+    python Code/GAN/train_gan.py --dry-run                  # how long?
+    python Code/GAN/train_gan.py --preset smoke --subjects A01   # plumbing
+    python Code/GAN/train_gan.py --preset fast              # ~4 h, resumable
     python Code/GAN/evaluate_gan.py --json gan_audit.json   # read the nn col
 
     python Code/StackedEnsemble/main.py                     # 0.72 reference
@@ -220,6 +329,9 @@ rather than paper over.
 -------------------------------------------------------------------------
 5. FILE MAP
 -------------------------------------------------------------------------
+Code/GAN/paths.py         EVERY filesystem location, as absolute Path
+                          objects. Edit PROJECT_ROOT here if the project
+                          moves; verify() fails fast listing missing files
 Code/GAN/data.py          canonical 875-sample window, the three ensemble
                           windows as exact crops of it, CAR + 4-40 Hz +
                           z-score, and the shared fold split that train_gan.py
@@ -256,11 +368,33 @@ Code/GAN/README.md        the design rationale and the paper citations
     subjects you are asking for.
 
 main.py prints "none" for every subject
-    Working as designed if the GAN is weak. Check step 2's nn column first:
+    Working as designed if the GAN is weak. Check step 2's amp column FIRST -
+    if it is outside [0.5, 2.0] the generators are simply under-trained and
+    nothing else in the table means anything. Then check the nn column:
     if it is below 0.7 the generators memorised and need retraining
     (more steps, or leave --no-diffaug off). If nn is healthy and the gate
     still says none, the GAN genuinely is not adding information.
 
 Out of memory / too slow
-    Lower --batch-size (default 32) or --steps. The model is ~1.4M parameters
-    per network, so memory is rarely the constraint; time is.
+    Lower --batch-size (default 16) or --steps, or use --preset fast. Memory
+    is rarely the constraint; time is. Run --dry-run first, always.
+
+"Dataset paths are not configured correctly"
+    Edit PROJECT_ROOT in Code/GAN/paths.py, or set BCI_PROJECT_ROOT /
+    BCI_DATA_DIR / BCI_LABELS_DIR. The message lists exactly what is missing.
+
+"the cache was built with --preset smoke"
+    Working as intended. A smoke cache is noise; main.py refuses to train on
+    it. Retrain that subject with --preset fast or better.
+
+"gate_folds must be at least 2"
+    A one-fold gate has no validation set to score candidates on. Use 2+.
+
+aug stays at 0.00 during a long run
+    The augmentation controller is driven by r_v: the fraction of the critic's
+    real/fake score gap that is explained by train-vs-unseen-real rather than
+    by real-vs-fake - i.e. by memorisation. Early on r_v is near 0 because the
+    critic has not overfitted yet, so no augmentation is needed and 0.00 is
+    correct. If r_v climbs past ~0.4 and aug stays at 0, that is a bug. If r_v
+    itself never moves across a whole run, check the W~ column is not stuck -
+    the critic may not be learning at all.

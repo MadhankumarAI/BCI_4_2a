@@ -48,14 +48,13 @@ import numpy as np
 
 sys.path.append(str(Path(__file__).resolve().parent))
 
+import paths as P
 import data as D
 import gan_metrics as M
 
-CKPT_DIR = Path(__file__).resolve().parent / "checkpoints"
-
 FIDELITY_KEYS = [
-    "psd_log_distance", "band_err_8-13Hz", "band_err_13-30Hz",
-    "frechet_tangent", "sliced_wasserstein",
+    "amplitude_ratio", "psd_log_distance", "band_err_8-13Hz",
+    "band_err_13-30Hz", "frechet_tangent", "sliced_wasserstein",
 ]
 
 
@@ -71,9 +70,11 @@ def real_in_gan_space(X_raw):
 
 
 def evaluate_subject(subject):
-    path = CKPT_DIR / f"{subject}_synth.npz"
+    path = P.synth_file(subject)
     if not path.exists():
-        raise FileNotFoundError(f"{path} missing - run train_gan.py first")
+        raise FileNotFoundError(
+            f"{path} missing - run train_gan.py for {subject} first"
+        )
 
     store = np.load(path, allow_pickle=True)
     cfg = json.loads(str(store["config"]))
@@ -82,7 +83,10 @@ def evaluate_subject(subject):
     X_real = real_in_gan_space(X_train)
 
     rep = {"subject": subject, "n_train": len(X_train),
-           "gate_folds": cfg["gate_folds"]}
+           "gate_folds": cfg["gate_folds"], "preset": cfg.get("preset")}
+    if cfg.get("preset") == "smoke":
+        print(f"NOTE {subject} was trained with --preset smoke; the numbers "
+              f"below describe noise, not a real generator.")
 
     # --- fidelity: full generator vs. its own training distribution ---
     X_fake, y_fake = store["X_full"], store["y_full"]
@@ -120,12 +124,14 @@ def evaluate_subject(subject):
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--subjects", nargs="+", default=D.SUBJECTS)
+    p.add_argument("--subjects", nargs="+", default=P.SUBJECTS)
     p.add_argument("--json", type=str, default=None,
                    help="also write the full report to this path")
     args = p.parse_args()
 
-    header = (f"{'subj':<5}{'PSD':>8}{'mu err':>9}{'beta err':>10}"
+    P.verify(args.subjects)
+
+    header = (f"{'subj':<5}{'amp':>7}{'PSD':>8}{'mu err':>9}{'beta err':>10}"
               f"{'FTD':>9}{'SWD':>8}{'nn':>7}{'TSTR':>8}{'TRTS':>8}{'base':>8}")
     print(header)
     print("-" * len(header))
@@ -135,6 +141,7 @@ def main():
         r = evaluate_subject(s)
         reports.append(r)
         print(f"{r['subject']:<5}"
+              f"{r['amplitude_ratio']:>7.2f}"
               f"{r['psd_log_distance']:>8.3f}"
               f"{r['band_err_8-13Hz']:>9.3f}"
               f"{r['band_err_13-30Hz']:>10.3f}"
@@ -150,11 +157,21 @@ def main():
         return float(np.mean(vals)) if vals else float("nan")
 
     print("-" * len(header))
-    print(f"{'mean':<5}{avg('psd_log_distance'):>8.3f}"
+    print(f"{'mean':<5}{avg('amplitude_ratio'):>7.2f}"
+          f"{avg('psd_log_distance'):>8.3f}"
           f"{avg('band_err_8-13Hz'):>9.3f}{avg('band_err_13-30Hz'):>10.3f}"
           f"{avg('frechet_tangent'):>9.2f}{avg('sliced_wasserstein'):>8.3f}"
           f"{avg('nn_ratio'):>7.2f}{avg('tstr'):>8.3f}"
           f"{avg('trts'):>8.3f}{avg('trtr_baseline'):>8.3f}")
+
+    weak = [r["subject"] for r in reports
+            if not 0.5 <= r["amplitude_ratio"] <= 2.0]
+    if weak:
+        print(f"\nWARNING amplitude off by more than 2x: {', '.join(weak)}")
+        print("These generators are under-trained - their synthetic trials "
+              "have the wrong power, so their spatial covariances are wrong "
+              "by the square of that. Retrain with a larger --preset before "
+              "reading anything else in this table.")
 
     flagged = [r["subject"] for r in reports if r.get("nn_ratio", 1.0) < 0.7]
     if flagged:

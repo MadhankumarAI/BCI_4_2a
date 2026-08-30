@@ -70,6 +70,23 @@ def segment_recombine(X, y, n_new, n_segments=4, seed=0):
     return np.asarray(out_X), np.asarray(out_y)
 
 
+def _balanced_source_indices(y, n_new, rng):
+    """Pick `n_new` source trials with the classes evenly split.
+
+    Drawing source trials uniformly at random gives a binomially varying class
+    split - at n_new=40 that is routinely 24/16. Every consumer of these
+    functions assumes a balanced synthetic block (draw_synthetic in main.py
+    even rounds n_new down to an even number for it), and an unbalanced block
+    silently shifts the base learners' priors, which is exactly the kind of
+    quiet bias that would show up as a real-looking accuracy change.
+    """
+    classes = np.unique(y)
+    per = n_new // len(classes)
+    return np.concatenate([
+        rng.choice(np.where(y == c)[0], size=per, replace=True) for c in classes
+    ])
+
+
 def gaussian_noise(X, y, n_new, sigma=0.05, seed=0):
     """
     Copy random trials and add white noise at `sigma` times the trial std.
@@ -79,7 +96,7 @@ def gaussian_noise(X, y, n_new, sigma=0.05, seed=0):
     downstream classifier and has nothing to do with generative modelling.
     """
     rng = _rng(seed)
-    idx = rng.integers(0, len(X), n_new)
+    idx = _balanced_source_indices(y, n_new, rng)
     base = X[idx]
     scale = base.std(axis=(1, 2), keepdims=True) * sigma
     return base + rng.standard_normal(base.shape) * scale, y[idx]
@@ -92,9 +109,9 @@ def time_shift(X, y, n_new, max_frac=0.1, seed=0):
     label-preserving transform rather than a distortion.
     """
     rng = _rng(seed)
-    idx = rng.integers(0, len(X), n_new)
+    idx = _balanced_source_indices(y, n_new, rng)
+    out = np.empty((len(idx),) + X.shape[1:])
     max_shift = max(1, int(X.shape[1] * max_frac))
-    out = np.empty((n_new,) + X.shape[1:])
     for i, j in enumerate(idx):
         out[i] = np.roll(X[j], rng.integers(-max_shift, max_shift + 1), axis=0)
     return out, y[idx]

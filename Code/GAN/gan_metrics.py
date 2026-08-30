@@ -75,6 +75,25 @@ def _mean_psd(X, fs=FS, nperseg=256):
     return f, P.mean(axis=(0, 2))
 
 
+def amplitude_ratio(X_real, X_fake):
+    """
+    Per-channel standard deviation of synthetic over real.
+
+    The cheapest and most revealing single number in the panel, and the one
+    this code originally lacked. An under-trained generator gets the spectral
+    SHAPE roughly right long before it gets the SCALE right, so the log-PSD
+    distance can look unremarkable while the synthetic trials carry a seventh
+    of the real power. Covariance-based classifiers - which is most of this
+    ensemble - are then handed trials whose spatial covariance is off by a
+    factor of ~50, and they will happily fit that.
+
+    Want ~1.0. Outside [0.5, 2.0] the generator is not ready to use.
+    """
+    r = float(np.mean(X_real.std(axis=(0, 1))))
+    f = float(np.mean(X_fake.std(axis=(0, 1))))
+    return f / max(r, 1e-12)
+
+
 def psd_log_distance(X_real, X_fake, fmax=45.0):
     """
     Mean absolute difference of log10 PSD, over 1-45 Hz.
@@ -286,6 +305,7 @@ def tstr_trts(X_real, y_real, X_fake, y_fake, X_holdout, y_holdout):
 def full_report(X_real, y_real, X_fake, y_fake, X_holdout=None, y_holdout=None):
     """Run the whole panel. Returns a flat dict, ready to print or serialise."""
     rep = {
+        "amplitude_ratio": amplitude_ratio(X_real, X_fake),
         "psd_log_distance": psd_log_distance(X_real, X_fake),
         "frechet_tangent": frechet_tangent_distance(X_real, X_fake),
         "sliced_wasserstein": sliced_wasserstein(X_real, X_fake),

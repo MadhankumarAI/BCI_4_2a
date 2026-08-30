@@ -42,8 +42,10 @@ import numpy as np
 import sys
 from pathlib import Path
 
+sys.path.append(str(Path(__file__).resolve().parent))
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
+import paths as P
 from data_loader import load_and_epoch_data, load_true_labels
 from preprocessing import bandpass_filter, common_average_reference
 
@@ -68,10 +70,11 @@ STRICT_MI_WINDOW = (3.25, 6.0)
 # 50 Hz line noise, no EOG residual to waste capacity on.
 GAN_BAND = (4.0, 40.0)
 
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-DATA_DIR = REPO_ROOT / "BCICIV-2a-mat"
-LABELS_DIR = REPO_ROOT / "true_labels"
-SUBJECTS = [f"A0{i}" for i in range(1, 10)]
+# Filesystem locations live in paths.py; re-exported here so callers that
+# already import this module do not need a second import.
+DATA_DIR = P.DATA_DIR
+LABELS_DIR = P.LABELS_DIR
+SUBJECTS = P.SUBJECTS
 
 
 def crop_window(X, start_sec, end_sec):
@@ -96,9 +99,9 @@ def load_subject(subject, window=BASE_WINDOW):
     X_test  : (n_test, samples, 22)
     y_test  : (n_test,)
     """
-    t_file = DATA_DIR / f"{subject}T.mat"
-    e_file = DATA_DIR / f"{subject}E.mat"
-    lbl_file = LABELS_DIR / f"{subject}E.mat"
+    t_file = P.train_file(subject)
+    e_file = P.eval_file(subject)
+    lbl_file = P.true_labels_file(subject)
 
     X_train, y_train, _ = load_and_epoch_data(
         t_file, start_sec=window[0], end_sec=window[1], fs=FS
@@ -153,6 +156,68 @@ def from_gan_space(Z, stats):
     return Z * sd + mu
 
 
+def postprocess_synthetic(X):
+    """
+    Put freshly generated trials through the same CAR + band-pass the real
+    trials get, so the cache holds data in exactly the space that will be
+    consumed.
+
+    Without this the cached synthetic keeps whatever out-of-band energy the
+    generator happened to emit, while the real trials it is compared against
+    are band-limited. Two things then go wrong: evaluate_gan.py scores an
+    unfair comparison, and its numbers stop describing what main.py actually
+    feeds the classifiers (main.py preps everything itself, so it was never
+    affected - but an audit that measures something other than the deployed
+    data is worse than no audit).
+
+    Both operations are idempotent, so main.py re-running them is a no-op.
+    """
+    return bandpass_filter(
+        common_average_reference(np.asarray(X, dtype=np.float64)),
+        GAN_BAND[0], GAN_BAND[1], FS,
+    )
+
+
+def discarded_power(X):
+    """
+    How much of a raw generated signal's power the pipeline will throw away,
+    split by cause.
+
+    Reported separately on purpose. Lumping them together was actively
+    misleading: a single "out of band 80%" figure looked like a spectral
+    problem when the real culprit was the common-mode component, which is a
+    completely different bug with a completely different fix.
+
+    Returns
+    -------
+    dict with
+      common_mode : share of power removed by CAR. Real CAR'd trials sum to
+          zero across channels at every time point; anything the generator
+          puts in the common mode is deleted. Should be ~0 now that the
+          generator projects it out - a large value means that projection is
+          not being applied.
+      out_of_band : share of the REMAINING power removed by the 4-40 Hz
+          band-pass. A large value means the generator is spending capacity
+          outside the band the classifiers read - undertrained, or, if the
+          energy sits at high frequency, the upsampling-aliasing failure that
+          Hartmann et al. warn about.
+    """
+    Xc = np.asarray(X, dtype=np.float64)
+    total = float(np.mean(Xc ** 2))
+    if total <= 0:
+        return {"common_mode": float("nan"), "out_of_band": float("nan")}
+
+    car = common_average_reference(Xc)
+    p_car = float(np.mean(car ** 2))
+    band = bandpass_filter(car, GAN_BAND[0], GAN_BAND[1], FS)
+    p_band = float(np.mean(band ** 2))
+
+    return {
+        "common_mode": max(0.0, 1.0 - p_car / total),
+        "out_of_band": max(0.0, 1.0 - p_band / max(p_car, 1e-20)),
+    }
+
+
 GATE_FOLD_SEED = 1234
 
 
@@ -172,6 +237,12 @@ def gate_fold_ids(y, n_folds, seed=GATE_FOLD_SEED):
     """
     from sklearn.model_selection import StratifiedKFold
 
+    if n_folds < 2:
+        raise ValueError(
+            f"gate_folds must be at least 2, got {n_folds}. A one-fold gate "
+            "has no validation set to score candidates on, which is the whole "
+            "point of it."
+        )
     skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
     ids = np.empty(len(y), dtype=int)
     for k, (_, val) in enumerate(skf.split(np.zeros(len(y)), y)):

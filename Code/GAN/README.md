@@ -111,9 +111,30 @@ because the ops are differentiable the generator still gets clean gradients.
 Critically the augmentation is only seen by the critic, so the generator's
 output distribution stays unbiased — unlike augmenting the training set.
 
-Strength is controlled by Karras et al.'s `r_t` heuristic (the mean sign of
-the critic's output on real data, a direct read on how much it is
-overfitting): above target, strength rises; below, it falls.
+**Which overfitting signal drives the strength matters.** The obvious choice
+is Karras et al.'s well-known `r_t = E[sign(D(real))]`, and it is wrong here.
+That heuristic works for a non-saturating GAN because the discriminator's
+logits are calibrated around zero when it cannot separate real from fake. A
+WGAN critic has no such calibration — its output is an unbounded score that in
+practice sits entirely on one side of zero. `r_t` therefore pins at −1 or +1,
+the controller decays strength to zero every run, and the single most
+important small-data safeguard is silently switched off. This was a live bug
+in the first version of this code; the symptom was `aug 0.00` on every line of
+every training log.
+
+The fix is Karras et al.'s other, scale-free statistic:
+
+    r_v = (E[D(real_train)] − E[D(real_val)]) / (E[D(real_train)] − E[D(fake)])
+
+the fraction of the critic's real-vs-fake gap that is explained by
+train-vs-unseen-real rather than by real-vs-fake — that is, by memorisation.
+`r_v ≈ 0` means the critic treats unseen real trials just like its training
+trials; `r_v → 1` means it separates them as hard as it separates fakes.
+
+`real_val` is carved out of each generator's **own** training portion (~12 %),
+never from the gate's held-out fold — tuning augmentation against the gate's
+validation trials would leak them back into the synthetic data and undo the
+whole point of the per-fold generators.
 
 The ops are chosen to be label-preserving for motor imagery — time shift,
 amplitude and per-channel gain, channel dropout, noise, cutout. Channel
@@ -171,7 +192,16 @@ ratio, TSTR/TRTS) per fold against trials the generator never saw. Asking the
 second pair against training data would be meaningless — a memorising
 generator scores perfectly on both.
 
-The metric to read first is **`nn`**, the nearest-neighbour distance ratio:
+The metric to read **first** is **`amp`**, the amplitude ratio — synthetic
+per-channel standard deviation over real, after identical CAR and band-pass.
+Want ≈1.0; outside [0.5, 2.0] the generator is under-trained and nothing else
+in the table is worth reading. It earns first place because an under-trained
+generator gets the spectral *shape* roughly right long before it gets the
+*scale* right, so the log-PSD distance can look unremarkable while the
+covariance-based models — most of this ensemble — are handed trials whose
+spatial covariance is off by the square of the error.
+
+The metric to read second is **`nn`**, the nearest-neighbour distance ratio:
 mean distance from a fake to its nearest real trial, over the mean distance
 between two real trials.
 
@@ -182,6 +212,81 @@ between two real trials.
 Nothing in the panel feeds into the final model. The decision is made by
 downstream accuracy on held-out real trials; the panel is diagnosis and audit
 trail.
+
+### Constraining the generator to the subspace the data occupies
+
+The real trials satisfy two exact linear constraints before the critic ever
+sees them, and a plain generator violates both. Each violation costs twice: it
+hands the critic a trivial real/fake tell that has nothing to do with EEG, and
+it spends output range on a component the pipeline deletes anyway.
+
+- **Zero DC per channel** (mean over time). The trials are band-passed, so
+  their per-channel temporal mean is zero by construction — measured at
+  0.003 µV. A freshly initialised generator emitted ≈0.9 in normalised units.
+- **Zero common mode** (mean over channels) — the CAR constraint. This one was
+  far more expensive: re-applying CAR to a trained generator's output destroyed
+  **79 % of its power**, because the generator was pouring energy into a
+  component that is identically zero in every real trial. Downstream that
+  showed up as synthetic trials at a seventh of real amplitude.
+
+`Generator._finish` projects both out. Two mean-subtractions along different
+axes; differentiable, parameter-free, and they commute.
+
+### EMA warmup
+
+Samples are drawn from an exponential moving average of the generator weights,
+because a WGAN generator oscillates around its optimum rather than settling on
+it. With a fixed decay of 0.999 the average has a ~1000-step memory — so on any
+run shorter than several thousand generator steps it is still dominated by the
+**random initialisation**, and the cached synthetic data is noise no matter how
+well the live generator trained. Measured: live generator at amplitude ×0.99 of
+real, EMA-sampled cache at ×0.14. The decay now ramps in as
+`min(0.999, (1+t)/(10+t))`.
+
+This is also why the in-training monitor samples the EMA weights rather than
+the live ones — a monitor has to watch the artefact that actually ships.
+
+## Cost
+
+This model is expensive on CPU, and the honest numbers matter because the
+protocol needs 1 + `gate_folds` generators per subject. Measured on a
+12-logical-core CPU at batch size 16:
+
+| preset | per generator | total | notes |
+|---|---|---|---|
+| `smoke` | seconds | — | output is noise; plumbing check only |
+| `fast` | ~8 min | ~4 h (27 gens) | usable, under-trained |
+| `balanced` | ~23 min | ~14 h (36 gens) | default |
+| `thorough` | ~50 min | ~29 h (36 gens) | closest to Hartmann's budget |
+
+`train_gan.py --dry-run` times a few real steps at each resolution on your
+machine and extrapolates, so you get the true figure before committing.
+
+Four things bring this down from the ~7.5 h/generator a direct transcription
+of the paper's architecture costs, none of which change the method:
+
+- **Narrower high-resolution stages** (`STAGE_CHANNELS`). Convolution cost
+  goes as `C_in · C_out · length`, so at 896 samples one block costs more than
+  the first three stages combined — and those stages are refining detail on
+  structure the low-resolution stages already fixed, so they need less
+  capacity than the equal-width ladder a GPU implementation would use.
+- **Tapered step budget** (`STAGE_STEP_SCALE`), for the same reason. Karras'
+  equal budgets spend 60 % of wall-clock on the last two stages.
+- **Lazy gradient penalty** (`--gp-every 4`, StyleGAN2). The penalty needs a
+  double backward through the critic and costs about as much as the rest of
+  the critic step; the constraint it enforces changes slowly, so evaluating it
+  a quarter as often at 4× the weight is close to free. `--gp-every 1` gives
+  textbook WGAN-GP.
+- **Batch 16 rather than 32.** On CPU cost is near-linear in batch size, and
+  WGAN-GP with minibatch-stddev is stable well below 32.
+
+The remaining lever, not taken by default: generating at 125 Hz instead of
+250 Hz. Motor imagery lives below 40 Hz, so the signal is 3× oversampled, and
+halving the length would drop the most expensive stage entirely. It is left
+out because it would require the same downsample/upsample round trip on the
+real trials to keep real and synthetic indistinguishable to the
+augmented-covariance model, which is another moving part in a pipeline whose
+argument rests on having few of them.
 
 ## Honest expectations
 
@@ -222,3 +327,17 @@ than paper over.
   compared against that same baseline, so the internal comparison is
   like-for-like, but quote the two numbers separately.
 - **Cue-period caveat** as described under Suemitsu & Nambu above.
+- **The augmentation controller withholds ~12 % of each generator's trials**
+  for the `r_v` statistic. At ~110 trials that is real capacity given up. It
+  buys a working memorisation defence, which at this sample size is the better
+  trade, but it is a trade.
+
+## Configuration
+
+All filesystem locations are absolute `pathlib.Path` objects in
+`Code/GAN/paths.py` — edit `PROJECT_ROOT` if the project moves, or override
+with the `BCI_PROJECT_ROOT` / `BCI_DATA_DIR` / `BCI_LABELS_DIR` /
+`BCI_CHECKPOINT_DIR` environment variables. Every entry point calls
+`paths.verify()` before doing any work, so a wrong path fails in the first
+second with a list of exactly which files are missing. `python
+Code/GAN/paths.py` prints the resolved configuration and checks it.

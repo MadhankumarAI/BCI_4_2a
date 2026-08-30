@@ -83,6 +83,7 @@ sys.path.append(str(HERE))
 sys.path.append(str(CODE))
 sys.path.append(str(CODE / "Ensemble"))
 
+import paths as P
 import data as D
 from augment import CLASSICAL_METHODS
 from preprocessing import apply_filter_bank, bandpass_filter, common_average_reference
@@ -91,8 +92,6 @@ from advanced_riemann import FilterBankCovariances, FilterBankTangentSpace
 
 warnings.filterwarnings("ignore")
 
-CKPT_DIR = HERE / "checkpoints"
-
 
 def _load_stacked_models():
     """Import the base-model wrappers from Code/StackedEnsemble/main.py.
@@ -100,7 +99,7 @@ def _load_stacked_models():
     Loaded by path under a distinct module name rather than by `import main`,
     because this file is also called main.py and would shadow it.
     """
-    path = CODE / "StackedEnsemble" / "main.py"
+    path = P.STACKED_ENSEMBLE_MAIN
     spec = importlib.util.spec_from_file_location("stacked_ensemble_impl", path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules["stacked_ensemble_impl"] = mod
@@ -386,7 +385,7 @@ def run_subject(subject, args):
 
     # ---- cached generator samples ----------------------------------------
     pools, full_pool, fold_ids = {}, None, None
-    npz_path = CKPT_DIR / f"{subject}_synth.npz"
+    npz_path = P.synth_file(subject)
     if npz_path.exists() and not args.no_gan:
         store = np.load(npz_path, allow_pickle=True)
         cfg = json.loads(str(store["config"]))
@@ -396,10 +395,30 @@ def run_subject(subject, args):
                 f"the loader produced {len(X_train)} - the cache is stale, "
                 f"re-run train_gan.py"
             )
+        if cfg.get("preset") == "smoke":
+            raise RuntimeError(
+                f"{subject}: the cache was built with --preset smoke, whose "
+                f"output is deliberately noise (8 steps per stage). Using it "
+                f"would put junk into the base learners. Retrain with "
+                f"--preset fast or better, or pass --no-gan."
+            )
         # prep() the synthetic trials too: they were saved post-CAR and
         # post-band-pass already, and both operations are idempotent, so this
         # only guarantees identical treatment rather than changing them.
         full_pool = (prep(store["X_full"]), store["y_full"])
+
+        # Amplitude sanity on the cached synthetic. Covariance-based models -
+        # which is most of this ensemble - see the SQUARE of any scale error,
+        # so a generator at half amplitude hands them covariances four times
+        # too small. Not fatal (the gate scores candidates on real held-out
+        # trials and will reject junk), but silently feeding it in would make
+        # a "the GAN did not help" result uninterpretable.
+        amp = float(full_pool[0].std()) / max(float(X_train.std()), 1e-12)
+        if not 0.5 <= amp <= 2.0:
+            print(f"  WARNING cached synthetic amplitude is x{amp:.2f} of "
+                  f"real - this generator is under-trained. The gate will "
+                  f"most likely reject it; retrain with a larger --preset "
+                  f"for a meaningful comparison.")
         fold_ids = store["fold_ids"]
         for k in range(int(cfg["gate_folds"])):
             pools[k] = (prep(store[f"X_fold{k}"]), store[f"y_fold{k}"])
@@ -494,7 +513,7 @@ def run_subject(subject, args):
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--subjects", nargs="+", default=D.SUBJECTS)
+    p.add_argument("--subjects", nargs="+", default=P.SUBJECTS)
     p.add_argument("--gate-folds", type=int, default=3,
                    help="only used when no cached generators are present; "
                         "otherwise the cache's own fold count wins")
@@ -507,11 +526,15 @@ def main():
     p.add_argument("--json", type=str, default=None)
     args = p.parse_args()
 
+    P.verify(args.subjects)
+
     print("=" * 70)
     print("GAN-AUGMENTED STACKED ENSEMBLE - Left vs Right motor imagery")
     print("15 base learners (5 models x 3 windows) + LR meta-learner")
     print("Augmentation chosen per subject by leak-free CV, one-SE rule")
     print("=" * 70)
+    print("Paths:")
+    print(P.describe())
 
     results = []
     for s in args.subjects:

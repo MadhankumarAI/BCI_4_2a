@@ -1,2 +1,6 @@
 __pycache__
 venv
+
+# GAN generator weights and cached synthetic trials - large binaries,
+# regenerate with Code/GAN/train_gan.py
+Code/GAN/checkpoints/
