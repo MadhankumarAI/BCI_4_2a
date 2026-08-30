@@ -398,3 +398,70 @@ aug stays at 0.00 during a long run
     correct. If r_v climbs past ~0.4 and aug stays at 0, that is a bug. If r_v
     itself never moves across a whole run, check the W~ column is not stuck -
     the critic may not be learning at all.
+
+
+
+
+
+
+
+
+
+
+
+
+here 
+
+
+Runbook
+Step 0 — Setup (2 min)
+
+.\venv\Scripts\activate
+python Code/GAN/paths.py
+Look for: all 9 subjects' files present. If not, edit PROJECT_ROOT in Code/GAN/paths.py — everything else derives from it. On another machine, pip install -r requirements.txt first (torch is a new dependency).
+
+Step 1 — Time it before committing
+
+python Code/GAN/train_gan.py --dry-run
+Times real steps on your machine and exits. On this box: fast ≈ 4 h, balanced ≈ 14 h, thorough ≈ 29 h.
+
+Look for: a total you're willing to wait for. Don't skip this — my original estimate was off by 8×.
+
+Step 2 — Prove the plumbing (1 min)
+
+python Code/GAN/train_gan.py --preset smoke --subjects A01
+Look for: it completes and saves. The samples are noise by design — main.py refuses to consume a smoke cache, so this can't contaminate anything.
+
+Step 3 — Train (the long one)
+
+python Code/GAN/train_gan.py --preset fast          # or balanced
+python Code/GAN/train_gan.py --skip-existing        # resume / upgrade later
+Resumable per subject. Watch the first subject's log for ~3 minutes — you'll know early whether it's working:
+
+Signal	Healthy	Trouble
+amp ... in-band per stage	climbs toward 1.0 by stage 5	flat, or still ≪1 at stage 5 → under-trained, raise --preset
+lost to CAR	0%	>5% → the common-mode projection isn't firing (bug)
+amplitude x… per generator	0.5–2.0, ideally ~1.0	outside → warning prints; don't use it
+r_v	starts ~0, rises later	never moves → check W~ isn't stuck; critic not learning
+aug	0.00 early, engages once r_v > 0.4	stuck at 0.00 while r_v > 0.4 → bug
+The authoritative number is the per-generator amplitude x… line, not the per-stage out-of-band (they use different band definitions — the stage line is for spotting a trend).
+
+Step 4 — Audit (fast, don't skip)
+
+python Code/GAN/evaluate_gan.py --json gan_audit.json
+Read the columns in this order:
+
+amp — want ~1.0. Outside [0.5, 2.0] you get a warning and nothing else in the row means anything. Covariance models see the square of a scale error.
+nn — want ~1.0. Below 0.7 = the generator memorised training trials. Reject that subject: useless as augmentation, and a re-identification hazard clinically. Above ~3 = off-manifold, under-trained.
+TSTR vs base — want within a few points. TRTS near TSTR; much higher means unnaturally separable fakes.
+PSD / mu err / beta err — mu and beta matter more than overall PSD.
+Don't pick a generator by best FTD. Hartmann §5: their best-FID model had the worst spectra.
+
+Step 5 — The result
+
+python Code/StackedEnsemble/main.py                            # 0.72 reference
+python Code/GAN/main.py --no-gan --json res_classical.json     # ablation
+python Code/GAN/main.py --all-candidates --json res_gan.json   # with GAN
+Compare all three. If run 3 isn't meaningfully above run 2, the GAN didn't help — a legitimate finding at 110 trials/subject, and what the gate exists to detect.
+
+Look for: several subjects printing none. That is the one-standard-error rule working, not a bug. Also expect >>> none to reproduce your ~0.72 baseline territory — note this pipeline band-limits everything to 4–40 Hz, so its none row is the band-limited variant, not a bit-identical rerun. Quote the two separately.
